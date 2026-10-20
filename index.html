@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1c1c1e">
+<title>影けし</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.js"></script>
+<style>
+:root{--bg:#f4f4f6;--card:#fff;--ink:#1c1c1e;--sub:#6b6b73;--accent:#0a7cff;--line:#dcdce1;--danger:#e5484d}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--card:#1c1c1e;--ink:#f2f2f5;--sub:#9a9aa3;--line:#38383d}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif;padding:env(safe-area-inset-top) 14px calc(env(safe-area-inset-bottom) + 24px)}
+h1{font-size:20px;margin:16px 0 4px}
+.sub{color:var(--sub);font-size:13px;margin:0 0 12px;line-height:1.5}
+.card{background:var(--card);border-radius:14px;padding:12px;margin-bottom:12px;border:1px solid var(--line)}
+button{font:inherit;border:0;border-radius:10px;padding:12px 14px;background:var(--accent);color:#fff;font-weight:600}
+button.sec{background:transparent;color:var(--accent);border:1px solid var(--line)}
+button.on{background:var(--ink);color:var(--bg)}
+button:disabled{opacity:.45}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+.row>*{flex:1 1 auto}
+label{font-size:13px;color:var(--sub);display:flex;gap:8px;align-items:center}
+label input[type=range]{flex:1}
+#stage{position:relative;width:100%;line-height:0;border-radius:10px;overflow:hidden;background:repeating-conic-gradient(#8883 0 25%,#0000 0 50%) 0 0/16px 16px}
+#stage canvas{width:100%;height:auto;display:block}
+#stage #ov,#stage #res{position:absolute;left:0;top:0;width:100%;height:100%}
+#ov{touch-action:none;image-rendering:auto}
+#res{pointer-events:none}
+#status{font-size:13px;color:var(--sub);min-height:20px;margin:6px 0 0;white-space:pre-line}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:6px;display:none}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<h1>影けし</h1>
+<p class="sub">写真の影(自分・手・スマホの影など)を、明るい部分に合わせて消します。写真は端末の外に送られません。</p>
+
+<div class="card">
+  <div class="row"><button id="pick">写真を選ぶ</button></div>
+  <input id="file" type="file" accept="image/*" class="hide">
+  <div id="stage" class="hide">
+    <canvas id="src"></canvas>
+    <canvas id="ov"></canvas>
+    <canvas id="res" class="hide"></canvas>
+  </div>
+</div>
+
+<div class="card hide" id="tools">
+  <div style="font-size:13px;color:var(--sub);margin-bottom:6px">① 影の部分を指でなぞって塗る(はみ出してOK)</div>
+  <div class="row">
+    <button id="bBrush" class="on">ブラシ</button>
+    <button id="bErase" class="sec">消しゴム</button>
+    <button id="bAuto" class="sec">自動検出</button>
+    <button id="bClear" class="sec">クリア</button>
+  </div>
+  <div class="row"><label>太さ <input id="size" type="range" min="3" max="60" value="20"></label></div>
+  <div class="row"><label>自動検出の感度 <input id="sens" type="range" min="50" max="95" value="78"></label></div>
+  <div style="font-size:13px;color:var(--sub);margin:10px 0 6px">② 実行</div>
+  <div class="row"><label>強さ <input id="str" type="range" min="30" max="100" value="100"></label></div>
+  <div class="row"><button id="run">影を消す</button></div>
+  <div class="bar" id="bar"><i id="barI"></i></div>
+  <div id="status"></div>
+</div>
+
+<div class="card hide" id="after">
+  <div class="row">
+    <button id="cmp" class="sec">長押しで元の写真</button>
+    <button id="save">保存・共有</button>
+  </div>
+  <div class="row"><button id="again" class="sec">塗り直してもう一度</button></div>
+</div>
+
+<script id="core">
+// ===== 純粋な計算部分(テストしやすいように分離) =====
+const MW = 640, MH = 480; // モデルの入力サイズ(固定)
+
+// 画像座標(x,y)→モデル配列の添字。縦長写真は転置してモデルに渡す
+function makeIdx(portrait) {
+  return portrait ? (x, y) => x * MW + y : (x, y) => y * MW + x;
+}
+
+function boxBlur(src, w, h, r) {
+  if (r < 1) return Float32Array.from(src);
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  const k = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const o = y * w; let s = 0;
+    for (let i = -r; i <= r; i++) s += src[o + Math.min(w - 1, Math.max(0, i))];
+    for (let x = 0; x < w; x++) {
+      tmp[o + x] = s / k;
+      s += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let i = -r; i <= r; i++) s += tmp[Math.min(h - 1, Math.max(0, i)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / k;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+// 低解像度RGBA → モデル入力(CHW, 0..1)とマスク
+function buildInputs(rgba, mask, lw, lh) {
+  const portrait = lh > lw, idx = makeIdx(portrait);
+  const n = MW * MH, inp = new Float32Array(3 * n), m = new Float32Array(n);
+  for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) {
+    const p = y * lw + x, q = idx(x, y);
+    inp[q] = rgba[p * 4] / 255; inp[n + q] = rgba[p * 4 + 1] / 255; inp[2 * n + q] = rgba[p * 4 + 2] / 255;
+    m[q] = mask[p] ? 1 : 0;
+  }
+  return { inp, m };
+}
+
+// モデル出力 ÷ 入力 = 明るさの補正倍率(画像向きのRGB 3面)
+function buildRatio(inp, out, lw, lh) {
+  const portrait = lh > lw, idx = makeIdx(portrait), n = MW * MH;
+  const eps = 0.04, R = [0, 1, 2].map(() => new Float32Array(lw * lh));
+  for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) {
+    const p = y * lw + x, q = idx(x, y);
+    for (let c = 0; c < 3; c++) {
+      let r = (Math.min(1, Math.max(0, out[c * n + q])) + eps) / (inp[c * n + q] + eps);
+      R[c][p] = Math.min(6, Math.max(0.9, r));
+    }
+  }
+  return R.map(pl => boxBlur(pl, lw, lh, 2));
+}
+
+// フル解像度に補正を適用(ratio・weightは低解像度。双線形で拡大して掛ける)
+function applyRatio(rgba, W, H, R, wt, lw, lh, strength) {
+  const out = new Uint8ClampedArray(rgba.length);
+  const x0 = new Int32Array(W), x1 = new Int32Array(W), fx = new Float32Array(W);
+  for (let x = 0; x < W; x++) {
+    const f = Math.min(lw - 1, Math.max(0, (x + .5) / W * lw - .5));
+    x0[x] = Math.floor(f); x1[x] = Math.min(lw - 1, x0[x] + 1); fx[x] = f - x0[x];
+  }
+  const bl = (pl, a, b, c, d, tx, ty) => (pl[a] * (1 - tx) + pl[b] * tx) * (1 - ty) + (pl[c] * (1 - tx) + pl[d] * tx) * ty;
+  for (let y = 0; y < H; y++) {
+    const f = Math.min(lh - 1, Math.max(0, (y + .5) / H * lh - .5));
+    const y0 = Math.floor(f), y1 = Math.min(lh - 1, y0 + 1), ty = f - y0;
+    for (let x = 0; x < W; x++) {
+      const a = y0 * lw + x0[x], b = y0 * lw + x1[x], c = y1 * lw + x0[x], d = y1 * lw + x1[x], tx = fx[x];
+      const w = bl(wt, a, b, c, d, tx, ty) * strength, o = (y * W + x) * 4;
+      for (let k = 0; k < 3; k++) {
+        const r = bl(R[k], a, b, c, d, tx, ty);
+        out[o + k] = rgba[o + k] * (1 + w * (r - 1));
+      }
+      out[o + 3] = 255;
+    }
+  }
+  return out;
+}
+
+// 影の自動検出(ゆるい目安。ブラシで直す前提)
+function autoMask(rgba, lw, lh, thr) {
+  const n = lw * lh, L = new Float32Array(n);
+  for (let i = 0; i < n; i++) L[i] = (0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2]) / 255;
+  const B = boxBlur(L, lw, lh, Math.round(Math.max(lw, lh) / 90));
+  const s = Float32Array.from(B).sort(); const ref = s[Math.floor(n * 0.85)];
+  const m = new Uint8Array(n);
+  for (let i = 0; i < n; i++) m[i] = B[i] < ref * thr ? 1 : 0;
+  return m;
+}
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const MODEL_PARTS = ['model/m.part01','model/m.part02','model/m.part03','model/m.part04','model/m.part05','model/m.part06','model/m.part07','model/m.part08','model/m.part09'];
+const MODEL_VER = 'sf-istd-plus-v2';
+const MAXSIDE = 2560;
+
+let photo = null;            // フル解像度 ImageData
+let lw = 0, lh = 0;          // 低解像度(モデル用)サイズ
+let lowRGBA = null, mask = null;
+let tool = 'brush', session = null, resultImg = null;
+
+const src = $('src'), ov = $('ov'), res = $('res');
+const status = t => $('status').textContent = t;
+const progress = f => { $('bar').style.display = f == null ? 'none' : 'block'; if (f != null) $('barI').style.width = (f * 100) + '%'; };
+
+$('pick').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image(); img.src = URL.createObjectURL(f);
+  try { await img.decode(); } catch (_) { status('この画像は開けませんでした'); return; }
+  let W = img.naturalWidth, H = img.naturalHeight, s = Math.min(1, MAXSIDE / Math.max(W, H));
+  W = Math.round(W * s); H = Math.round(H * s);
+  src.width = W; src.height = H;
+  const c = src.getContext('2d', { willReadFrequently: true });
+  c.drawImage(img, 0, 0, W, H);
+  photo = c.getImageData(0, 0, W, H);
+  URL.revokeObjectURL(img.src);
+  // 低解像度(横長 640x480 / 縦長 480x640)
+  const portrait = H > W; lw = portrait ? MH : MW; lh = portrait ? MW : MH;
+  const t = document.createElement('canvas'); t.width = lw; t.height = lh;
+  const tc = t.getContext('2d', { willReadFrequently: true });
+  tc.drawImage(src, 0, 0, lw, lh);
+  lowRGBA = tc.getImageData(0, 0, lw, lh).data;
+  mask = new Uint8Array(lw * lh);
+  ov.width = lw; ov.height = lh;
+  res.width = W; res.height = H;
+  ['stage', 'tools'].forEach(i => $(i).classList.remove('hide'));
+  $('after').classList.add('hide'); res.classList.add('hide');
+  drawMask(); status('');
+  $('pick').textContent = '別の写真を選ぶ';
+  $('stage').scrollIntoView({ block: 'nearest' });
+};
+
+function drawMask() {
+  const c = ov.getContext('2d'), d = c.createImageData(lw, lh);
+  for (let i = 0; i < lw * lh; i++) if (mask[i]) { d.data[i * 4] = 255; d.data[i * 4 + 1] = 60; d.data[i * 4 + 2] = 60; d.data[i * 4 + 3] = 110; }
+  c.putImageData(d, 0, 0);
+}
+
+// ---- ブラシ ----
+let drawing = false, last = null;
+function stamp(x, y, v) {
+  const r = +$('size').value * (lw / 640) * 0.7 + 1, r2 = r * r;
+  for (let j = Math.max(0, Math.floor(y - r)); j <= Math.min(lh - 1, Math.ceil(y + r)); j++)
+    for (let i = Math.max(0, Math.floor(x - r)); i <= Math.min(lw - 1, Math.ceil(x + r)); i++)
+      if ((i - x) ** 2 + (j - y) ** 2 <= r2) mask[j * lw + i] = v;
+}
+function pos(e) { const b = ov.getBoundingClientRect(); return [(e.clientX - b.left) / b.width * lw, (e.clientY - b.top) / b.height * lh]; }
+function paint(e) {
+  const [x, y] = pos(e), v = tool === 'brush' ? 1 : 0;
+  if (last) { const dx = x - last[0], dy = y - last[1], n = Math.ceil(Math.hypot(dx, dy)); for (let k = 1; k <= n; k++) stamp(last[0] + dx * k / n, last[1] + dy * k / n, v); }
+  else stamp(x, y, v);
+  last = [x, y]; drawMask();
+}
+ov.addEventListener('pointerdown', e => { drawing = true; last = null; ov.setPointerCapture(e.pointerId); paint(e); e.preventDefault(); });
+ov.addEventListener('pointermove', e => { if (drawing) { paint(e); e.preventDefault(); } });
+['pointerup', 'pointercancel'].forEach(t => ov.addEventListener(t, () => { drawing = false; last = null; }));
+
+function setTool(t) { tool = t; $('bBrush').className = t === 'brush' ? 'on' : 'sec'; $('bErase').className = t === 'erase' ? 'on' : 'sec'; }
+$('bBrush').onclick = () => setTool('brush');
+$('bErase').onclick = () => setTool('erase');
+$('bClear').onclick = () => { mask.fill(0); drawMask(); };
+$('bAuto').onclick = () => { mask = autoMask(lowRGBA, lw, lh, +$('sens').value / 100); drawMask(); status('自動検出しました。ブラシ/消しゴムで直してください。'); };
+
+// ---- モデル読み込み(初回のみダウンロード。以後は端末に保存) ----
+async function loadModelBytes() {
+  const cache = await caches.open(MODEL_VER).catch(() => null);
+  const SIZES = [10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 7082348];
+  const all = new Uint8Array(SIZES.reduce((a, b) => a + b, 0));
+  let o = 0;
+  for (let i = 0; i < MODEL_PARTS.length; i++) {
+    const name = MODEL_PARTS[i].split('/').pop();
+    // model/ フォルダの中、または index.html と同じ場所のどちらでも探す
+    const cands = ['model/' + name, name];
+    let r = null;
+    for (const u of cands) { r = cache && await cache.match(u); if (r) break; }
+    if (!r) {
+      status(`モデルを読み込み中…(初回のみ ${i + 1}/${MODEL_PARTS.length})`); progress(i / MODEL_PARTS.length);
+      for (const u of cands) {
+        let net = null;
+        try { net = await fetch(u); } catch (_) {}
+        if (net && net.ok && +(net.headers.get('content-length') || SIZES[i]) === SIZES[i]) {
+          if (cache) { try { await cache.put(u, net.clone()); } catch (_) {} }
+          r = net; break;
+        }
+      }
+      if (!r) throw new Error('モデルファイルが見つかりません: ' + name + '(index.html と同じ場所か model フォルダに置いてください)');
+    }
+    const buf = new Uint8Array(await r.arrayBuffer());
+    if (buf.length !== SIZES[i]) throw new Error(name + ' のサイズが違います(' + buf.length + ' / 正しくは ' + SIZES[i] + ')。アップロードし直してください');
+    all.set(buf, o); o += buf.length;
+  }
+  return all;
+}
+async function makeSession(eps) {
+  const bytes = await loadModelBytes();
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
+  ort.env.wasm.proxy = false; // メモリ節約(処理中は画面が止まります)
+  return ort.InferenceSession.create(bytes, { executionProviders: eps, graphOptimizationLevel: 'all' });
+}
+async function runModel(inp, m) {
+  const feeds = () => ({ input: new ort.Tensor('float32', inp, [1, 3, MH, MW]), mask: new ort.Tensor('float32', m, [1, 1, MH, MW]) });
+  if (!session) {
+    try { session = await makeSession(['webgpu']); session._ep = 'webgpu'; }
+    catch (_) { session = await makeSession(['wasm']); session._ep = 'wasm'; }
+  }
+  status('影を消しています…(' + (session._ep === 'webgpu' ? 'GPU' : 'CPU: 数十秒かかります') + ')'); progress(null);
+  await new Promise(r => setTimeout(r, 80)); // 表示を更新してから重い処理へ
+  try { return (await session.run(feeds())).output.data; }
+  catch (e) {
+    if (session._ep === 'webgpu') { session = await makeSession(['wasm']); session._ep = 'wasm'; status('CPUで再実行中…(数十秒かかります)'); return (await session.run(feeds())).output.data; }
+    throw e;
+  }
+}
+
+// ---- 実行 ----
+$('run').onclick = async () => {
+  if (!mask.some(v => v)) { status('先に影の部分を塗ってください(または自動検出)'); return; }
+  $('run').disabled = true;
+  try {
+    const { inp, m } = buildInputs(lowRGBA, mask, lw, lh);
+    const out = await runModel(inp, m);
+    status('仕上げ中…');
+    const R = buildRatio(inp, out, lw, lh);
+    const wt = boxBlur(boxBlur(Float32Array.from(mask), lw, lh, Math.round(lw / 100) + 2), lw, lh, Math.round(lw / 160) + 1);
+    for (let i = 0; i < wt.length; i++) wt[i] = Math.min(1, wt[i] * 1.6);
+    const px = applyRatio(photo.data, photo.width, photo.height, R, wt, lw, lh, +$('str').value / 100);
+    res.getContext('2d').putImageData(new ImageData(px, photo.width, photo.height), 0, 0);
+    res.classList.remove('hide'); ov.classList.add('hide'); $('after').classList.remove('hide');
+    status('完了。長押しで元の写真と比べられます。'); progress(null);
+  } catch (e) {
+    console.error(e); status('失敗しました: ' + (e && e.message || e)); progress(null);
+  } finally { $('run').disabled = false; }
+};
+
+// 比較(押している間だけ元の写真)
+const cmp = $('cmp');
+const showOrig = v => res.classList.toggle('hide', v);
+['pointerdown'].forEach(t => cmp.addEventListener(t, e => { showOrig(true); e.preventDefault(); }));
+['pointerup', 'pointercancel', 'pointerleave'].forEach(t => cmp.addEventListener(t, () => showOrig(false)));
+cmp.addEventListener('contextmenu', e => e.preventDefault());
+
+$('again').onclick = () => { res.classList.add('hide'); ov.classList.remove('hide'); $('after').classList.add('hide'); $('stage').scrollIntoView({ block: 'nearest' }); };
+
+$('save').onclick = () => {
+  res.toBlob(async b => {
+    const file = new File([b], 'kage-kesi.jpg', { type: 'image/jpeg' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    }
+    window.open(URL.createObjectURL(b), '_blank'); status('開いた画像を長押しして「写真に追加」してください。');
+  }, 'image/jpeg', 0.95);
+};
+</script>
+</body>
+</html>
