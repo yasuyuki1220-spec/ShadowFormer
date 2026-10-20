@@ -251,20 +251,25 @@ async function loadModelBytes() {
   for (let i = 0; i < MODEL_PARTS.length; i++) {
     const name = MODEL_PARTS[i].split('/').pop();
     // model/ フォルダの中、または index.html と同じ場所のどちらでも探す
-    const cands = ['model/' + name, name];
+    // 保存時に名前が変わっても見つけられるよう、よくある変化も探す
+    const names = [name, name + '.bin', name + '.txt', name.replace('.', '_'), name.replace('m.part', 'm.part.')];
+    const cands = [];
+    for (const n of names) cands.push('model/' + n, n, 'Model/' + n);
     let r = null;
     for (const u of cands) { r = cache && await cache.match(u); if (r) break; }
     if (!r) {
       status(`モデルを読み込み中…(初回のみ ${i + 1}/${MODEL_PARTS.length})`); progress(i / MODEL_PARTS.length);
+      const tried = [];
       for (const u of cands) {
         let net = null;
-        try { net = await fetch(u); } catch (_) {}
-        if (net && net.ok && +(net.headers.get('content-length') || SIZES[i]) === SIZES[i]) {
+        try { net = await fetch(u, { cache: 'no-store' }); } catch (_) {}
+        tried.push(u + '→' + (net ? net.status : 'エラー'));
+        if (net && net.ok) {
           if (cache) { try { await cache.put(u, net.clone()); } catch (_) {} }
           r = net; break;
         }
       }
-      if (!r) throw new Error('モデルファイルが見つかりません: ' + name + '(index.html と同じ場所か model フォルダに置いてください)');
+      if (!r) throw new Error('モデルファイルが見つかりません: ' + name + '\n探した場所: ' + location.href.replace(/[^/]*$/, '') + '\n' + tried.slice(0, 3).join(' / '));
     }
     const buf = new Uint8Array(await r.arrayBuffer());
     if (buf.length !== SIZES[i]) throw new Error(name + ' のサイズが違います(' + buf.length + ' / 正しくは ' + SIZES[i] + ')。アップロードし直してください');
