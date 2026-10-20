@@ -49,6 +49,12 @@ label input[type=range]{flex:1}
 </div>
 
 <div class="card hide" id="tools">
+  <div style="font-size:13px;color:var(--sub);margin-bottom:6px">方式</div>
+  <div class="row">
+    <button id="mDoc" class="on">書類・ノート向け(速い)</button>
+    <button id="mAi" class="sec">AI(人物・風景)</button>
+  </div>
+  <div id="modeNote" style="font-size:12px;color:var(--sub);margin:2px 0 10px;line-height:1.5">紙の明るさのムラを全体で平らにします。塗らなくても使えます(塗るとその部分だけ補正)。</div>
   <div style="font-size:13px;color:var(--sub);margin-bottom:6px">① 影の部分を指でなぞって塗る(はみ出してOK)</div>
   <div class="row">
     <button id="bBrush" class="on">ブラシ</button>
@@ -154,6 +160,42 @@ function applyRatio(rgba, W, H, R, wt, lw, lh, strength) {
     }
   }
   return out;
+}
+
+// ===== 書類モード(AIなし): 影の中の「紙の明るさ」を周りの明るい紙に合わせる =====
+function maxFilter(src, w, h, r) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) { const o = y * w;
+    for (let x = 0; x < w; x++) { let m = 0; const a = Math.max(0, x - r), b = Math.min(w - 1, x + r);
+      for (let i = a; i <= b; i++) { const v = src[o + i]; if (v > m) m = v; } tmp[o + x] = m; } }
+  for (let x = 0; x < w; x++)
+    for (let y = 0; y < h; y++) { let m = 0; const a = Math.max(0, y - r), b = Math.min(h - 1, y + r);
+      for (let j = a; j <= b; j++) { const v = tmp[j * w + x]; if (v > m) m = v; } out[y * w + x] = m; }
+  return out;
+}
+function docRatio(rgba, mask, lw, lh) {
+  const n = lw * lh, r = Math.max(5, Math.round(Math.max(lw, lh) / 40));
+  const B = [], T = [];
+  for (let c = 0; c < 3; c++) {
+    const P = new Float32Array(n);
+    for (let i = 0; i < n; i++) P[i] = rgba[i * 4 + c] / 255;
+    B.push(boxBlur(maxFilter(P, lw, lh, r), lw, lh, r >> 1));   // 紙の明るさ(文字や線を消した「地」の明るさ)
+  }
+  // 手本: 影の外にある明るい紙の明るさ(上位の値)
+  const lum = new Float32Array(n), outIdx = [];
+  for (let i = 0; i < n; i++) { lum[i] = (B[0][i] + B[1][i] + B[2][i]) / 3; if (!mask[i]) outIdx.push(i); }
+  const pool = outIdx.length > n * 0.05 ? outIdx : Array.from({ length: n }, (_, i) => i);
+  const pl = pool.map(i => lum[i]).sort((a, b) => a - b), top = pl[Math.floor(pl.length * 0.95)];
+  const paper = pool.filter(i => lum[i] >= 0.7 * top);
+  const pick = (ch) => { const v = paper.map(i => B[ch][i]).sort((a, b) => a - b); return v[Math.floor(v.length * 0.9)]; };
+  const T3 = [pick(0), pick(1), pick(2)], Tl = (T3[0] + T3[1] + T3[2]) / 3;
+  const R = [0, 1, 2].map(() => new Float32Array(n).fill(1));
+  for (let i = 0; i < n; i++) if (mask[i]) {
+    // 暗すぎる所(絨毯・物の影の濃い部分など)は紙ではないので触らない
+    const sf = Math.min(1, Math.max(0, (lum[i] - 0.4 * Tl) / (0.15 * Tl)));
+    for (let c = 0; c < 3; c++) R[c][i] = 1 + (Math.min(2.2, Math.max(1, T3[c] / Math.max(0.05, B[c][i]))) - 1) * sf;
+  }
+  return R.map(pl2 => boxBlur(pl2, lw, lh, 2));
 }
 
 // 影の自動検出(ゆるい目安。ブラシで直す前提)
@@ -295,15 +337,34 @@ async function runModel(inp, m) {
 }
 
 // ---- 実行 ----
+let mode = 'doc';
+function setMode(m) {
+  mode = m; $('mDoc').className = m === 'doc' ? 'on' : 'sec'; $('mAi').className = m === 'ai' ? 'on' : 'sec';
+  $('modeNote').textContent = m === 'doc'
+    ? '紙の明るさのムラを全体で平らにします。塗らなくても使えます(塗るとその部分だけ補正)。'
+    : 'AIが影の部分を推定して直します。影を塗ってから実行してください。初回は読み込みに時間がかかります。';
+}
+$('mDoc').onclick = () => setMode('doc');
+$('mAi').onclick = () => setMode('ai');
+
 $('run').onclick = async () => {
-  if (!mask.some(v => v)) { status('先に影の部分を塗ってください(または自動検出)'); return; }
+  const painted = mask.some(v => v);
+  if (mode === 'ai' && !painted) { status('先に影の部分を塗ってください(または自動検出)'); return; }
   $('run').disabled = true;
   try {
-    const { inp, m } = buildInputs(lowRGBA, mask, lw, lh);
-    const out = await runModel(inp, m);
-    status('仕上げ中…');
-    const R = buildRatio(inp, out, lw, lh);
-    const wt = boxBlur(boxBlur(Float32Array.from(mask), lw, lh, Math.round(lw / 100) + 2), lw, lh, Math.round(lw / 160) + 1);
+    let R, wt;
+    if (mode === 'doc') {
+      status('補正中…'); await new Promise(r => setTimeout(r, 30));
+      const m = painted ? mask : new Uint8Array(lw * lh).fill(1);
+      R = docRatio(lowRGBA, m, lw, lh);
+      wt = painted ? boxBlur(boxBlur(Float32Array.from(mask), lw, lh, Math.round(lw / 100) + 2), lw, lh, Math.round(lw / 160) + 1) : new Float32Array(lw * lh).fill(1);
+    } else {
+      const { inp, m } = buildInputs(lowRGBA, mask, lw, lh);
+      const out = await runModel(inp, m);
+      status('仕上げ中…');
+      R = buildRatio(inp, out, lw, lh);
+      wt = boxBlur(boxBlur(Float32Array.from(mask), lw, lh, Math.round(lw / 100) + 2), lw, lh, Math.round(lw / 160) + 1);
+    }
     for (let i = 0; i < wt.length; i++) wt[i] = Math.min(1, wt[i] * 1.6);
     const px = applyRatio(photo.data, photo.width, photo.height, R, wt, lw, lh, +$('str').value / 100);
     res.getContext('2d').putImageData(new ImageData(px, photo.width, photo.height), 0, 0);
