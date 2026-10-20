@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#1c1c1e">
 <title>影けし</title>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.webgpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.wasm.min.js"></script>
 <style>
 :root{--bg:#f4f4f6;--card:#fff;--ink:#1c1c1e;--sub:#6b6b73;--accent:#0a7cff;--line:#dcdce1;--danger:#e5484d}
 @media (prefers-color-scheme:dark){:root{--bg:#111113;--card:#1c1c1e;--ink:#f2f2f5;--sub:#9a9aa3;--line:#38383d}}
@@ -75,7 +75,7 @@ label input[type=range]{flex:1}
 
 <script id="core">
 // ===== 純粋な計算部分(テストしやすいように分離) =====
-const MW = 640, MH = 480; // モデルの入力サイズ(固定)
+const MW = 320, MH = 240; // モデルの入力サイズ(固定)
 
 // 画像座標(x,y)→モデル配列の添字。縦長写真は転置してモデルに渡す
 function makeIdx(portrait) {
@@ -170,8 +170,8 @@ function autoMask(rgba, lw, lh, thr) {
 
 <script>
 const $ = id => document.getElementById(id);
-const MODEL_PARTS = ['model/m.part01','model/m.part02','model/m.part03','model/m.part04','model/m.part05','model/m.part06','model/m.part07','model/m.part08','model/m.part09'];
-const MODEL_VER = 'sf-istd-plus-v2';
+const MODEL_PARTS = ['model/s.part01','model/s.part02','model/s.part03','model/s.part04','model/s.part05','model/s.part06'];
+const MODEL_VER = 'sf-istd-plus-small-v3';
 const MAXSIDE = 2560;
 
 let photo = null;            // フル解像度 ImageData
@@ -220,7 +220,7 @@ function drawMask() {
 // ---- ブラシ ----
 let drawing = false, last = null;
 function stamp(x, y, v) {
-  const r = +$('size').value * (lw / 640) * 0.7 + 1, r2 = r * r;
+  const r = +$('size').value * (lw / 320) * 0.7 + 1, r2 = r * r;
   for (let j = Math.max(0, Math.floor(y - r)); j <= Math.min(lh - 1, Math.ceil(y + r)); j++)
     for (let i = Math.max(0, Math.floor(x - r)); i <= Math.min(lw - 1, Math.ceil(x + r)); i++)
       if ((i - x) ** 2 + (j - y) ** 2 <= r2) mask[j * lw + i] = v;
@@ -245,7 +245,7 @@ $('bAuto').onclick = () => { mask = autoMask(lowRGBA, lw, lh, +$('sens').value /
 // ---- モデル読み込み(初回のみダウンロード。以後は端末に保存) ----
 async function loadModelBytes() {
   const cache = await caches.open(MODEL_VER).catch(() => null);
-  const SIZES = [10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 10000000, 7082348];
+  const SIZES = [10000000, 10000000, 10000000, 10000000, 10000000, 7913897];
   const all = new Uint8Array(SIZES.reduce((a, b) => a + b, 0));
   let o = 0;
   for (let i = 0; i < MODEL_PARTS.length; i++) {
@@ -281,21 +281,17 @@ async function makeSession(eps) {
   const bytes = await loadModelBytes();
   ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
   ort.env.wasm.proxy = false; // メモリ節約(処理中は画面が止まります)
-  return ort.InferenceSession.create(bytes, { executionProviders: eps, graphOptimizationLevel: 'all' });
+  ort.env.wasm.numThreads = 1;
+  return ort.InferenceSession.create(bytes, { executionProviders: eps, graphOptimizationLevel: 'all', enableCpuMemArena: false, enableMemPattern: false });
 }
 async function runModel(inp, m) {
   const feeds = () => ({ input: new ort.Tensor('float32', inp, [1, 3, MH, MW]), mask: new ort.Tensor('float32', m, [1, 1, MH, MW]) });
   if (!session) {
-    try { session = await makeSession(['webgpu']); session._ep = 'webgpu'; }
-    catch (_) { session = await makeSession(['wasm']); session._ep = 'wasm'; }
+    session = await makeSession(['wasm']);
   }
-  status('影を消しています…(' + (session._ep === 'webgpu' ? 'GPU' : 'CPU: 数十秒かかります') + ')'); progress(null);
+  status('影を消しています…(10〜30秒ほど。画面が止まっても待ってください)'); progress(null);
   await new Promise(r => setTimeout(r, 80)); // 表示を更新してから重い処理へ
-  try { return (await session.run(feeds())).output.data; }
-  catch (e) {
-    if (session._ep === 'webgpu') { session = await makeSession(['wasm']); session._ep = 'wasm'; status('CPUで再実行中…(数十秒かかります)'); return (await session.run(feeds())).output.data; }
-    throw e;
-  }
+  return (await session.run(feeds())).output.data;
 }
 
 // ---- 実行 ----
